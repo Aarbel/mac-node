@@ -365,7 +365,9 @@ def on_login_check(
 class HermesHandler(BaseHTTPRequestHandler):
     server_version = "HermesMacNode/1.0"
     token: str = ""
-    task_dispatcher: Callable[[str, Dict[str, Any]], Dict[str, Any]] = default_task_dispatcher
+    task_dispatcher: Callable[[str, Dict[str, Any]], Dict[str, Any]] = staticmethod(  # type: ignore[assignment]
+        default_task_dispatcher
+    )
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         pass
@@ -479,7 +481,7 @@ def make_handler_class(
         pass
 
     ConfiguredHandler.token = token
-    ConfiguredHandler.task_dispatcher = disp
+    ConfiguredHandler.task_dispatcher = staticmethod(disp)
     return ConfiguredHandler
 
 
