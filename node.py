@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hmac
 import ipaddress
 import json
@@ -33,6 +34,8 @@ from ig_export import IgError, has_session_cookie
 
 HERMES_HOME = Path.home() / ".hermes-mac"
 DEFAULT_TOKEN_FILE = HERMES_HOME / "token"
+PORT_FILE = HERMES_HOME / "port"
+DEFAULT_PORT = 8791
 STATE_FILE = HERMES_HOME / "state.json"
 LOG_FILE = HERMES_HOME / "node.log"
 DUMPS_DIR = HERMES_HOME / "dumps"
@@ -63,6 +66,38 @@ LOGGER = _setup_logging()
 
 def load_token(path: Path) -> str:
     return path.read_text(encoding="utf-8").strip()
+
+
+def _parse_port_text(raw: str) -> Optional[int]:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        port = int(text)
+    except ValueError:
+        return None
+    if 1024 <= port <= 65535:
+        return port
+    return None
+
+
+def resolve_port(
+    flag_port: Optional[int],
+    env_value: Optional[str],
+    file_contents: Optional[str],
+) -> int:
+    """Resolve listen port: CLI flag → HERMES_MAC_PORT → port file → DEFAULT_PORT."""
+    if flag_port is not None and 1024 <= flag_port <= 65535:
+        return flag_port
+    if env_value is not None:
+        parsed = _parse_port_text(env_value)
+        if parsed is not None:
+            return parsed
+    if file_contents is not None:
+        parsed = _parse_port_text(file_contents)
+        if parsed is not None:
+            return parsed
+    return DEFAULT_PORT
 
 
 def is_tailscale_ip(ip_str: str) -> bool:
@@ -336,10 +371,12 @@ class HermesHandler(BaseHTTPRequestHandler):
         pass
 
     def _client_ip(self) -> str:
-        forwarded = self.headers.get("X-Forwarded-For")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-        return self.client_address[0]
+        peer = self.client_address[0]
+        if is_tailscale_ip(peer):
+            forwarded = self.headers.get("X-Forwarded-For")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+        return peer
 
     def _log_request(self, path: str, status: int, started: float) -> None:
         duration_ms = int((time.time() - started) * 1000)
@@ -451,10 +488,21 @@ def run_server(
     port: int,
     token_file: Path,
     dispatcher: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+    server_class: type = ThreadingHTTPServer,
 ) -> None:
     token = load_token(token_file)
     handler = make_handler_class(token, dispatcher)
-    server = ThreadingHTTPServer((bind, port), handler)
+    try:
+        server = server_class((bind, port), handler)
+    except OSError as exc:
+        in_use = exc.errno == errno.EADDRINUSE or "Address already in use" in str(exc)
+        if in_use:
+            print(
+                f"Port {port} is already in use; re-run install.sh to pick a free port.",
+                file=sys.stderr,
+            )
+            raise SystemExit(3) from exc
+        raise
     LOGGER.info("listening on %s:%s", bind, port)
     try:
         server.serve_forever()
@@ -464,14 +512,27 @@ def run_server(
         server.server_close()
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Hermes macOS browser node")
     parser.add_argument("--bind", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--token-file", type=DEFAULT_TOKEN_FILE)
+    parser.add_argument("--port", type=int, default=None, help="Listen port (overrides env and port file)")
+    parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
     parser.add_argument("--on-login", action="store_true", help="Run export check then serve")
     parser.add_argument("--check-only", action="store_true", help="Only run on-login check")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        if exc.code == 0:
+            return 0
+        traceback.print_exc(file=sys.stderr)
+        return 4
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return 4
 
     token_path = Path(args.token_file)
 
@@ -481,7 +542,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.check_only:
         return 0
 
-    run_server(args.bind, args.port, token_path)
+    port_file_contents: Optional[str] = None
+    if PORT_FILE.is_file():
+        port_file_contents = PORT_FILE.read_text(encoding="utf-8")
+    port = resolve_port(args.port, os.environ.get("HERMES_MAC_PORT"), port_file_contents)
+
+    run_server(args.bind, port, token_path)
     return 0
 
 

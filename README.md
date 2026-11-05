@@ -65,7 +65,22 @@ Exemple de `state.json` :
 - `GET /status` — vue de `state.json` + liste des dumps  
 - `POST /task` — `{"name":"...", "params":{...}}` (timeout tâche 300 s)
 
-URL typique après install : `http://<ip-tailscale>:8765`
+URL typique après install : `http://<ip-tailscale>:8791` (ou un autre port choisi automatiquement — voir ci-dessous).
+
+## Ports
+
+Lors de l’installation, `install.sh` choisit le **premier port libre** parmi `8791`, `8792`, `8793`, `8794`, `8899` et `9990`, l’enregistre dans `~/.hermes-mac/port` (fichier mode `600`) et configure le LaunchAgent avec `--port <valeur>`. Si tous ces ports sont occupés, le script s’arrête avec un message d’erreur.
+
+Pour **forcer** un port sans réinstaller :
+
+| Priorité | Source |
+|----------|--------|
+| 1 | argument `--port` de `node.py` |
+| 2 | variable d’environnement `HERMES_MAC_PORT` |
+| 3 | première ligne de `~/.hermes-mac/port` (entier 1024–65535) |
+| 4 | défaut **8791** |
+
+Si le nœud ne peut pas écouter (port déjà pris au démarrage), il quitte avec le **code de sortie 3** et indique de relancer `install.sh`, qui reprend un port libre et recharge le LaunchAgent.
 
 ## Désinstallation
 

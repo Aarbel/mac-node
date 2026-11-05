@@ -5,6 +5,7 @@ set -euo pipefail
 HERMES_DIR="${HOME}/.hermes-mac"
 VENV_DIR="${HERMES_DIR}/venv"
 TOKEN_FILE="${HERMES_DIR}/token"
+PORT_FILE="${HERMES_DIR}/port"
 STATE_FILE="${HERMES_DIR}/state.json"
 LOG_FILE="${HERMES_DIR}/node.log"
 PLIST_PATH="${HOME}/Library/LaunchAgents/com.hermes.macnode.plist"
@@ -12,10 +13,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REQUIREMENTS="${SCRIPT_DIR}/requirements.txt"
 NODE_PY="${SCRIPT_DIR}/node.py"
 LABEL="com.hermes.macnode"
+PORT_CANDIDATES=(8791 8792 8793 8794 8899 9990)
+
+port_is_free() {
+  python3 -c 'import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); sys.exit(0 if s.connect_ex(("127.0.0.1",int(sys.argv[1])))!=0 else 1)' "$1"
+}
+
+pick_free_port() {
+  local port
+  for port in "${PORT_CANDIDATES[@]}"; do
+    if port_is_free "${port}"; then
+      echo "${port}"
+      return 0
+    fi
+  done
+  return 1
+}
 
 render_plist() {
   local python_bin="$1"
   local repo_dir="$2"
+  local node_port="$3"
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,11 +45,15 @@ render_plist() {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>ProgramArguments</key>
   <array>
     <string>${python_bin}</string>
     <string>${repo_dir}/node.py</string>
     <string>--on-login</string>
+    <string>--port</string>
+    <string>${node_port}</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${repo_dir}</string>
@@ -45,7 +67,7 @@ PLIST
 }
 
 if [[ "${1:-}" == "--render-plist" ]]; then
-  render_plist "${VENV_DIR}/bin/python3" "${SCRIPT_DIR}"
+  render_plist "${VENV_DIR}/bin/python3" "${SCRIPT_DIR}" "8791"
   exit 0
 fi
 
@@ -94,8 +116,16 @@ if [[ "${CHROMIUM_INSTALLED}" -eq 0 ]]; then
   python3 -m playwright install chromium
 fi
 
+CHOSEN_PORT=""
+if ! CHOSEN_PORT="$(pick_free_port)"; then
+  echo "Erreur : aucun port libre parmi ${PORT_CANDIDATES[*]}." >&2
+  exit 1
+fi
+printf '%s\n' "${CHOSEN_PORT}" > "${PORT_FILE}"
+chmod 600 "${PORT_FILE}"
+
 PYTHON_BIN="${VENV_DIR}/bin/python3"
-render_plist "${PYTHON_BIN}" "${SCRIPT_DIR}" > "${PLIST_PATH}"
+render_plist "${PYTHON_BIN}" "${SCRIPT_DIR}" "${CHOSEN_PORT}" > "${PLIST_PATH}"
 
 launchctl unload "${PLIST_PATH}" 2>/dev/null || true
 launchctl load -w "${PLIST_PATH}"
@@ -124,9 +154,9 @@ fi
 echo ""
 echo "=== Hermes mac-node ==="
 if [[ -n "${TS_IP}" ]]; then
-  echo "URL du nœud : http://${TS_IP}:8765"
+  echo "URL du nœud : http://${TS_IP}:${CHOSEN_PORT}"
 else
-  echo "URL du nœud : http://<ip-tailscale>:8765 (installez Tailscale pour obtenir l'IP)"
+  echo "URL du nœud : http://<ip-tailscale>:${CHOSEN_PORT} (installez Tailscale pour obtenir l'IP)"
 fi
 echo "Jeton (Bearer) : ${TOKEN_FILE}"
 echo ""
