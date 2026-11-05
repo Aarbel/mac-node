@@ -2,17 +2,127 @@
 
 from __future__ import annotations
 
+import io
+import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import node  # noqa: E402
 from ig_export import IgError, NAVIGATION_STEP_KEYS, SELECTOR_STEPS  # noqa: E402
+
+
+class ResolvePortTests(unittest.TestCase):
+    def test_flag_over_env_and_file(self) -> None:
+        port = node.resolve_port(9001, "8800", "8899")
+        self.assertEqual(port, 9001)
+
+    def test_env_over_file_and_default(self) -> None:
+        port = node.resolve_port(None, "8800", "8899")
+        self.assertEqual(port, 8800)
+
+    def test_file_over_default(self) -> None:
+        port = node.resolve_port(None, None, "8899\n")
+        self.assertEqual(port, 8899)
+
+    def test_default_when_nothing_set(self) -> None:
+        self.assertEqual(node.resolve_port(None, None, None), node.DEFAULT_PORT)
+
+    def test_garbage_file_falls_back_to_default(self) -> None:
+        self.assertEqual(node.resolve_port(None, None, "not-a-port"), node.DEFAULT_PORT)
+
+    def test_out_of_range_file_rejected(self) -> None:
+        self.assertEqual(node.resolve_port(None, None, "80"), node.DEFAULT_PORT)
+        self.assertEqual(node.resolve_port(None, None, "70000"), node.DEFAULT_PORT)
+
+    def test_out_of_range_env_rejected(self) -> None:
+        self.assertEqual(node.resolve_port(None, "22", "8899"), 8899)
+
+
+class LoadStateTests(unittest.TestCase):
+    def test_empty_file_returns_empty_dict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_bytes(b"")
+            self.assertEqual(node.load_state(path), {})
+
+    def test_corrupt_json_returns_empty_dict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_bytes(b"{not json")
+            self.assertEqual(node.load_state(path), {})
+
+    def test_valid_json_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(json.dumps({"pending_request": True}), encoding="utf-8")
+            loaded = node.load_state(path)
+            self.assertTrue(loaded["pending_request"])
+
+
+class BindConflictTests(unittest.TestCase):
+    def test_bind_oserror_exits_code_3(self) -> None:
+        class FailingServer:
+            def __init__(self, address: tuple, handler: type) -> None:
+                raise OSError("Address already in use")
+
+        token_path = ROOT / "tests" / "fixtures" / "sample_state.json"
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as tf:
+            tf.write("test-token-for-bind\n")
+            token_file = Path(tf.name)
+        try:
+            with mock.patch.object(node, "load_token", return_value="tok"):
+                with self.assertRaises(SystemExit) as ctx:
+                    node.run_server("127.0.0.1", 8791, token_file, server_class=FailingServer)
+                self.assertEqual(ctx.exception.code, 3)
+        finally:
+            token_file.unlink(missing_ok=True)
+
+    def test_bind_message_names_port(self) -> None:
+        class FailingServer:
+            def __init__(self, address: tuple, handler: type) -> None:
+                raise OSError(node.errno.EADDRINUSE, "Address already in use")
+
+        stderr = io.StringIO()
+        with mock.patch.object(node, "load_token", return_value="tok"):
+            with mock.patch.object(sys, "stderr", stderr):
+                with self.assertRaises(SystemExit):
+                    node.run_server("127.0.0.1", 8791, Path("/dev/null"), server_class=FailingServer)
+        self.assertIn("8791", stderr.getvalue())
+        self.assertIn("install.sh", stderr.getvalue())
+
+
+class XForwardedForTests(unittest.TestCase):
+    def _handler_with(
+        self,
+        peer: str,
+        headers: dict | None = None,
+    ) -> node.HermesHandler:
+        handler = node.HermesHandler.__new__(node.HermesHandler)
+        handler.client_address = (peer, 12345)
+        handler.headers = headers or {}
+        return handler
+
+    def test_public_peer_spoofed_xff_uses_peer_for_auth(self) -> None:
+        h = self._handler_with("8.8.8.8", {"X-Forwarded-For": "100.100.1.1"})
+        self.assertEqual(h._client_ip(), "8.8.8.8")
+        ok, status, _ = node.check_auth(h._client_ip(), "Bearer x", "x")
+        self.assertFalse(ok)
+        self.assertEqual(status, 403)
+
+    def test_tailnet_peer_honours_xff(self) -> None:
+        h = self._handler_with("100.64.0.5", {"X-Forwarded-For": "100.100.1.1"})
+        self.assertEqual(h._client_ip(), "100.100.1.1")
+
+    def test_no_header_uses_socket_peer(self) -> None:
+        h = self._handler_with("100.100.1.2", {})
+        self.assertEqual(h._client_ip(), "100.100.1.2")
 
 
 class AuthMatrixTests(unittest.TestCase):
@@ -111,6 +221,10 @@ class PlistRenderTests(unittest.TestCase):
         self.assertIn("node.py", plist)
         self.assertIn("--on-login", plist)
         self.assertIn(".hermes-mac/venv/bin/python3", plist)
+        self.assertIn("<key>ThrottleInterval</key>", plist)
+        self.assertIn("<integer>30</integer>", plist)
+        self.assertIn("--port", plist)
+        self.assertRegex(plist, r"<string>--port</string>\s*\n\s*<string>\d+</string>")
 
 
 class SelectorTableTests(unittest.TestCase):
