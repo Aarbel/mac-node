@@ -512,14 +512,27 @@ def run_server(
         server.server_close()
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Hermes macOS browser node")
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=None, help="Listen port (overrides env and port file)")
-    parser.add_argument("--token-file", type=DEFAULT_TOKEN_FILE)
+    parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
     parser.add_argument("--on-login", action="store_true", help="Run export check then serve")
     parser.add_argument("--check-only", action="store_true", help="Only run on-login check")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        if exc.code == 0:
+            return 0
+        traceback.print_exc(file=sys.stderr)
+        return 4
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return 4
 
     token_path = Path(args.token_file)
 

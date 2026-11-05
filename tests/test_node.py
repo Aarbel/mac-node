@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import argparse
 from pathlib import Path
 from unittest import mock
 
@@ -248,6 +249,41 @@ class HandlerAuthIntegrationTests(unittest.TestCase):
     def test_known_tasks_set(self) -> None:
         self.assertIn("ig_state", node.KNOWN_TASKS)
         self.assertIn("browse", node.KNOWN_TASKS)
+
+
+class ArgparseAuditTests(unittest.TestCase):
+    def _assert_parser_sane(self, parser: argparse.ArgumentParser) -> None:
+        for action in parser._actions:
+            if action.type is not None:
+                self.assertTrue(callable(action.type), msg=f"{action.dest} type must be callable")
+            if action.default is argparse.SUPPRESS:
+                continue
+            self.assertFalse(
+                callable(action.default),
+                msg=f"{action.dest} default must not be a callable (use type= for converters)",
+            )
+
+    def test_node_parser_actions_sane(self) -> None:
+        self._assert_parser_sane(node.build_parser())
+
+    def test_ig_export_parser_actions_sane(self) -> None:
+        import ig_export
+
+        self._assert_parser_sane(ig_export.build_parser())
+
+    def test_node_main_help_exits_zero(self) -> None:
+        self.assertEqual(node.main(["--help"]), 0)
+
+    def test_node_parser_default_token_file(self) -> None:
+        args = node.build_parser().parse_args([])
+        self.assertEqual(args.token_file, node.DEFAULT_TOKEN_FILE)
+
+    def test_node_main_invalid_argument_exits_four(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            code = node.main(["--not-a-real-flag"])
+        self.assertEqual(code, 4)
+        self.assertIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import time
@@ -515,14 +516,17 @@ def browse(url: str) -> Dict[str, Any]:
         _close(pw, context)
 
 
-def main() -> None:
-    import argparse
-    import sys
-
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Instagram export helper")
     parser.add_argument("command", choices=["login", "state", "request", "download", "browse"])
     parser.add_argument("--url", default="")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    import sys
+
+    args = build_parser().parse_args()
     try:
         if args.command == "login":
             print(json.dumps(login()))
