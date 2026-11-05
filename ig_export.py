@@ -251,21 +251,45 @@ def _close(pw: Any, context: Any) -> None:
         pw.stop()
 
 
-def has_session_cookie(profile_dir: Optional[Path] = None) -> bool:
-    """Read Chromium Cookies DB (read-only) for Instagram sessionid."""
-    base = profile_dir or PROFILE_DIR
-    cookies_db = base / "Default" / "Cookies"
+def iter_cookie_db_paths(profile_dir: Path) -> List[Path]:
+    """Candidate Chromium cookie DB paths (read-only probes), most likely first."""
+    if not profile_dir.is_dir():
+        return []
+    rel_suffixes = (
+        ("Default", "Cookies"),
+        ("Default", "Network", "Cookies"),
+    )
+    roots: List[Path] = [profile_dir]
+    roots.extend(
+        p for p in sorted(profile_dir.iterdir()) if p.is_dir() and p.name.startswith("Profile ")
+    )
+    seen: set[Path] = set()
+    paths: List[Path] = []
+    for root in roots:
+        for suffix in rel_suffixes:
+            candidate = root.joinpath(*suffix)
+            if candidate.is_file() and candidate not in seen:
+                seen.add(candidate)
+                paths.append(candidate)
+    legacy = profile_dir / "Cookies"
+    if legacy.is_file() and legacy not in seen:
+        paths.append(legacy)
+    return paths
+
+
+def _sessionid_in_cookie_db(cookies_db: Path) -> Optional[bool]:
+    """Return True/False if DB readable; None if missing, empty, or corrupt."""
     if not cookies_db.is_file():
-        cookies_db = base / "Cookies"
-    if not cookies_db.is_file():
-        return False
+        return None
+    if cookies_db.stat().st_size == 0:
+        return None
     import sqlite3
 
     uri = f"file:{cookies_db}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True)
     except sqlite3.Error:
-        return False
+        return None
     try:
         cur = conn.cursor()
         cur.execute(
@@ -274,9 +298,27 @@ def has_session_cookie(profile_dir: Optional[Path] = None) -> bool:
         row = cur.fetchone()
         return row is not None
     except sqlite3.Error:
-        return False
+        return None
     finally:
         conn.close()
+
+
+def has_session_cookie(profile_dir: Optional[Path] = None) -> Optional[bool]:
+    """Read Chromium Cookies DB(s) (read-only) for Instagram sessionid."""
+    base = profile_dir or PROFILE_DIR
+    paths = iter_cookie_db_paths(base)
+    if not paths:
+        return None
+    saw_definite_no = False
+    for cookies_db in paths:
+        found = _sessionid_in_cookie_db(cookies_db)
+        if found is True:
+            return True
+        if found is False:
+            saw_definite_no = True
+    if saw_definite_no:
+        return False
+    return None
 
 
 def login() -> Dict[str, Any]:

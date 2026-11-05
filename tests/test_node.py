@@ -4,19 +4,55 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 import unittest
 import argparse
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import ig_export  # noqa: E402
 import node  # noqa: E402
-from ig_export import IgError, NAVIGATION_STEP_KEYS, SELECTOR_STEPS  # noqa: E402
+from ig_export import (  # noqa: E402
+    IgError,
+    NAVIGATION_STEP_KEYS,
+    SELECTOR_STEPS,
+    has_session_cookie,
+    iter_cookie_db_paths,
+)
+
+
+def _write_instagram_cookies_db(path: Path, *, include_session: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE cookies (host_key TEXT, name TEXT)")
+    if include_session:
+        conn.execute(
+            "INSERT INTO cookies (host_key, name) VALUES (?, ?)",
+            (".instagram.com", "sessionid"),
+        )
+    conn.commit()
+    conn.close()
+
+
+HERMES_HANDLER_METHODS = frozenset(
+    name
+    for name, value in vars(node.BaseHTTPRequestHandler).items()
+    if isinstance(value, types.FunctionType)
+) | frozenset(
+    name
+    for name, value in vars(node.HermesHandler).items()
+    if isinstance(value, types.FunctionType)
+)
 
 
 class ResolvePortTests(unittest.TestCase):
@@ -124,6 +160,131 @@ class XForwardedForTests(unittest.TestCase):
     def test_no_header_uses_socket_peer(self) -> None:
         h = self._handler_with("100.100.1.2", {})
         self.assertEqual(h._client_ip(), "100.100.1.2")
+
+
+class HandlerClassAttrTests(unittest.TestCase):
+    def test_task_dispatcher_is_staticmethod_on_base_and_configured(self) -> None:
+        self.assertIsInstance(node.HermesHandler.__dict__["task_dispatcher"], staticmethod)
+        configured = node.make_handler_class("tok", lambda _n, _p: {"ok": True})
+        self.assertIsInstance(configured.__dict__["task_dispatcher"], staticmethod)
+
+    def test_no_unexpected_bare_functions_on_handler(self) -> None:
+        for name, value in node.HermesHandler.__dict__.items():
+            if not isinstance(value, types.FunctionType):
+                continue
+            self.assertIn(
+                name,
+                HERMES_HANDLER_METHODS,
+                msg=f"{name} must be a method or staticmethod, not a bare function attribute",
+            )
+
+    def test_callable_class_attributes_use_staticmethod(self) -> None:
+        for cls in (node.HermesHandler, node.make_handler_class("t", lambda _n, _p: {"ok": True})):
+            for name, value in cls.__dict__.items():
+                if name.startswith("__") or name in HERMES_HANDLER_METHODS:
+                    continue
+                if isinstance(value, staticmethod):
+                    continue
+                if isinstance(value, types.FunctionType):
+                    self.fail(f"{cls.__name__}.{name} must be staticmethod, not a bare function")
+                if callable(value):
+                    self.fail(f"{cls.__name__}.{name} unexpected callable class attribute")
+
+
+class TaskHttpIntegrationTests(unittest.TestCase):
+    def test_post_task_over_http_uses_stub_dispatcher(self) -> None:
+        token = "integration-test-token"
+
+        def stub_dispatcher(name: str, params: dict) -> dict:
+            self.assertEqual(name, "ig_state")
+            self.assertEqual(params, {})
+            return {"ok": True, "data": {"stub": True}}
+
+        handler_cls = node.make_handler_class(token, stub_dispatcher)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        host, port = server.server_address[0], server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            payload = json.dumps({"name": "ig_state", "params": {}}).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://{host}:{port}/task",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with mock.patch.object(node, "is_tailscale_ip", return_value=True):
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    body = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(body.get("ok"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+class SessionCookieTests(unittest.TestCase):
+    def test_default_cookies_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db = base / "Default" / "Cookies"
+            _write_instagram_cookies_db(db, include_session=True)
+            self.assertTrue(has_session_cookie(base))
+
+    def test_default_network_cookies_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db = base / "Default" / "Network" / "Cookies"
+            _write_instagram_cookies_db(db, include_session=True)
+            self.assertTrue(has_session_cookie(base))
+
+    def test_profile_subdir_cookies_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db = base / "Profile 1" / "Default" / "Cookies"
+            _write_instagram_cookies_db(db, include_session=True)
+            self.assertTrue(has_session_cookie(base))
+
+    def test_readable_db_without_session_is_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db = base / "Default" / "Cookies"
+            _write_instagram_cookies_db(db, include_session=False)
+            self.assertFalse(has_session_cookie(base))
+
+    def test_empty_db_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db = base / "Default" / "Cookies"
+            db.parent.mkdir(parents=True)
+            db.write_bytes(b"")
+            self.assertIsNone(has_session_cookie(base))
+
+    def test_corrupt_db_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db = base / "Default" / "Cookies"
+            db.parent.mkdir(parents=True)
+            db.write_bytes(b"not an sqlite database")
+            self.assertIsNone(has_session_cookie(base))
+
+    def test_iter_cookie_db_paths_includes_expected_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            paths = {
+                base / "Default" / "Cookies",
+                base / "Default" / "Network" / "Cookies",
+                base / "Profile 2" / "Default" / "Cookies",
+            }
+            for p in paths:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"")
+            found = set(iter_cookie_db_paths(base))
+            self.assertTrue(paths.issubset(found))
 
 
 class AuthMatrixTests(unittest.TestCase):
